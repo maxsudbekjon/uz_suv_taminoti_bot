@@ -7,14 +7,16 @@ from telegram.ext import (
     filters, ContextTypes, ConversationHandler, CallbackQueryHandler
 )
 from dotenv import load_dotenv
+import sqlite3
+from typing import Dict, Any, List
 
 # .env faylidan o'qish
 load_dotenv()
 # Bot tokeni
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 
-# Admin usernamelari
-ADMINS = os.getenv("ADMINS").split(",") 
+# Admin usernamelari (trim qiling)
+ADMINS = [s.strip() for s in os.getenv("ADMINS", "").split(",") if s.strip()] 
 
 # Conversation states - Istemolchilar uchun
 VILOYAT, TUMAN, KVARTALI_TYPE, KVARTALI_NAME, MANZIL, RASM = range(6)
@@ -22,9 +24,8 @@ VILOYAT, TUMAN, KVARTALI_TYPE, KVARTALI_NAME, MANZIL, RASM = range(6)
 # Admin states
 ADMIN_MENU, ADMIN_FILTER_VILOYAT, ADMIN_FILTER_TUMAN, ADMIN_SEARCH_UY = range(6, 10)
 
-# Ma'lumotlar fayli
-DATA_FILE = "consumers_data.json"
-SETTINGS_FILE = "bot_settings.json"
+# Database fayli
+DB_FILE = "data.db"
 
 # Viloyatlar va tumanlar
 VILOYATLAR = {
@@ -44,77 +45,304 @@ VILOYATLAR = {
     "Qoraqalpog'iston": ["Nukus shahri", "Amudaryo", "Beruniy", "Chimboy", "Ellikqal'a", "Kegeyli", "Mo'ynoq", "Nukus", "Qonliko'l", "Qorao'zak", "Qo'ng'irot", "Shumanay", "Taxtako'pir", "To'rtko'l", "Xo'jayli"]
 }
 
-def load_data():
-    """Ma'lumotlarni yuklash (bo'sh yoki buzilgan JSONni qayta tiklash bilan)"""
+# ==================== DATABASE FUNKSIYALARI ====================
+
+def _get_conn():
+    """Database connection yaratish"""
+    return sqlite3.connect(DB_FILE, check_same_thread=False)
+
+def _init_db():
+    """Jadvallarni yaratish"""
+    conn = _get_conn()
+    cur = conn.cursor()
+    
+    # Consumers jadvali
+    cur.execute("""
+    CREATE TABLE IF NOT EXISTS consumers (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        user_id TEXT NOT NULL,
+        username TEXT,
+        first_name TEXT,
+        viloyat TEXT NOT NULL,
+        tuman TEXT NOT NULL,
+        kvartali_type TEXT,
+        kvartali_name TEXT,
+        manzil TEXT,
+        photo_id TEXT,
+        date TEXT NOT NULL
+    )
+    """)
+    
+    # Settings jadvali
+    cur.execute("""
+    CREATE TABLE IF NOT EXISTS settings (
+        key TEXT PRIMARY KEY,
+        value TEXT
+    )
+    """)
+    
+    conn.commit()
+    conn.close()
+    print("✅ Database initialized successfully")
+
+def load_data() -> Dict[str, Dict[str, List[Dict]]]:
+    """
+    Barcha ma'lumotlarni nested dict formatida qaytarish
+    Format: {viloyat: {tuman: [entry1, entry2, ...]}}
+    """
+    conn = _get_conn()
+    cur = conn.cursor()
+    
+    cur.execute("""
+        SELECT user_id, username, first_name, viloyat, tuman, 
+               kvartali_type, kvartali_name, manzil, photo_id, date 
+        FROM consumers
+        ORDER BY viloyat, tuman, date DESC
+    """)
+    
+    rows = cur.fetchall()
+    conn.close()
+    
+    data: Dict[str, Dict[str, List[Dict]]] = {}
+    
+    for row in rows:
+        user_id, username, first_name, viloyat, tuman, kvartali_type, kvartali_name, manzil, photo_id, date = row
+        
+        entry = {
+            'user_id': str(user_id),
+            'username': username or "Mavjud emas",
+            'first_name': first_name or "Noma'lum",
+            'kvartali_type': kvartali_type or "",
+            'kvartali_name': kvartali_name or "",
+            'manzil': manzil or "",
+            'photo_id': photo_id or "",
+            'date': date
+        }
+        
+        if viloyat not in data:
+            data[viloyat] = {}
+        if tuman not in data[viloyat]:
+            data[viloyat][tuman] = []
+            
+        data[viloyat][tuman].append(entry)
+    
+    return data
+
+def save_consumer_data(user_id: int, username: str, first_name: str, 
+                       viloyat: str, tuman: str, kvartali_type: str, 
+                       kvartali_name: str, manzil: str, photo_id: str) -> bool:
+    """
+    Yangi consumer ma'lumotini saqlash
+    """
     try:
-        with open(DATA_FILE, 'r', encoding='utf-8') as f:
-            text = f.read()
-            if not text.strip():
-                return {}
-            return json.loads(text)
-    except FileNotFoundError:
-        return {}
-    except json.JSONDecodeError:
-        # Agar fayl bo'sh yoki buzilgan bo'lsa, uni qayta yaratamiz
+        conn = _get_conn()
+        cur = conn.cursor()
+        
+        date = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        
+        cur.execute("""
+            INSERT INTO consumers 
+            (user_id, username, first_name, viloyat, tuman, kvartali_type, 
+             kvartali_name, manzil, photo_id, date)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """, (
+            str(user_id),
+            username,
+            first_name,
+            viloyat,
+            tuman,
+            kvartali_type,
+            kvartali_name,
+            manzil,
+            photo_id,
+            date
+        ))
+        
+        conn.commit()
+        conn.close()
+        return True
+    except Exception as e:
+        print(f"❌ Error saving consumer data: {e}")
+        return False
+
+def get_user_data(user_id: int) -> List[Dict]:
+    """
+    Foydalanuvchining barcha ma'lumotlarini olish
+    """
+    conn = _get_conn()
+    cur = conn.cursor()
+    
+    cur.execute("""
+        SELECT user_id, username, first_name, viloyat, tuman, 
+               kvartali_type, kvartali_name, manzil, photo_id, date 
+        FROM consumers
+        WHERE user_id = ?
+        ORDER BY date DESC
+    """, (str(user_id),))
+    
+    rows = cur.fetchall()
+    conn.close()
+    
+    result = []
+    for row in rows:
+        user_id, username, first_name, viloyat, tuman, kvartali_type, kvartali_name, manzil, photo_id, date = row
+        result.append({
+            'user_id': str(user_id),
+            'username': username or "Mavjud emas",
+            'first_name': first_name or "Noma'lum",
+            'viloyat': viloyat,
+            'tuman': tuman,
+            'kvartali_type': kvartali_type or "",
+            'kvartali_name': kvartali_name or "",
+            'manzil': manzil or "",
+            'photo_id': photo_id or "",
+            'date': date
+        })
+    
+    return result
+
+def get_all_user_ids() -> List[str]:
+    """
+    Barcha unique user_id larni olish (reminder uchun)
+    """
+    conn = _get_conn()
+    cur = conn.cursor()
+    
+    cur.execute("SELECT DISTINCT user_id FROM consumers")
+    rows = cur.fetchall()
+    conn.close()
+    
+    return [row[0] for row in rows]
+
+def search_by_address(search_term: str) -> List[Dict]:
+    """
+    Manzil bo'yicha qidirish
+    """
+    conn = _get_conn()
+    cur = conn.cursor()
+    
+    cur.execute("""
+        SELECT user_id, username, first_name, viloyat, tuman, 
+               kvartali_type, kvartali_name, manzil, photo_id, date 
+        FROM consumers
+        WHERE LOWER(manzil) LIKE ?
+        ORDER BY date DESC
+    """, (f"%{search_term.lower()}%",))
+    
+    rows = cur.fetchall()
+    conn.close()
+    
+    results = []
+    for row in rows:
+        user_id, username, first_name, viloyat, tuman, kvartali_type, kvartali_name, manzil, photo_id, date = row
+        results.append({
+            'viloyat': viloyat,
+            'tuman': tuman,
+            'entry': {
+                'user_id': str(user_id),
+                'username': username or "Mavjud emas",
+                'first_name': first_name or "Noma'lum",
+                'kvartali_type': kvartali_type or "",
+                'kvartali_name': kvartali_name or "",
+                'manzil': manzil or "",
+                'photo_id': photo_id or "",
+                'date': date
+            }
+        })
+    
+    return results
+
+def load_settings() -> Dict[str, Any]:
+    """Sozlamalarni bazadan olish"""
+    defaults = {
+        "reminder_time": "10:00",
+        "reminder_enabled": False,
+        "reminder_day": None
+    }
+    
+    conn = _get_conn()
+    cur = conn.cursor()
+    cur.execute("SELECT key, value FROM settings")
+    rows = cur.fetchall()
+    conn.close()
+    
+    if not rows:
+        return defaults
+    
+    result = defaults.copy()
+    for key, value in rows:
         try:
-            with open(DATA_FILE, 'w', encoding='utf-8') as f:
-                json.dump({}, f, ensure_ascii=False, indent=2)
-        except Exception:
-            pass
-        return {}
+            result[key] = json.loads(value)
+        except:
+            if value in ("True", "False"):
+                result[key] = (value == "True")
+            elif value.isdigit():
+                result[key] = int(value)
+            else:
+                result[key] = value
+    
+    return result
 
-def save_data(data):
-    """Ma'lumotlarni saqlash"""
-    with open(DATA_FILE, 'w', encoding='utf-8') as f:
-        json.dump(data, f, ensure_ascii=False, indent=2)
-
-def load_settings():
-    """Sozlamalarni yuklash (bo'sh yoki buzilgan JSONni qayta tiklash bilan)"""
-    default = {"reminder_time": "18:00", "reminder_enabled": False}
+def save_settings(settings: Dict[str, Any]) -> bool:
+    """Sozlamalarni bazaga saqlash"""
     try:
-        with open(SETTINGS_FILE, 'r', encoding='utf-8') as f:
-            text = f.read()
-            if not text.strip():
-                return default
-            return json.loads(text)
-    except FileNotFoundError:
-        return default
-    except json.JSONDecodeError:
-        # Agar fayl buzilgan bo'lsa, uni default bilan qayta yozamiz
-        try:
-            with open(SETTINGS_FILE, 'w', encoding='utf-8') as f:
-                json.dump(default, f, ensure_ascii=False, indent=2)
-        except Exception:
-            pass
-        return default
+        conn = _get_conn()
+        cur = conn.cursor()
+        
+        for key, value in settings.items():
+            if isinstance(value, (dict, list)):
+                val_str = json.dumps(value, ensure_ascii=False)
+            else:
+                val_str = str(value)
+            
+            cur.execute("""
+                INSERT INTO settings (key, value) 
+                VALUES (?, ?) 
+                ON CONFLICT(key) DO UPDATE SET value=excluded.value
+            """, (key, val_str))
+        
+        conn.commit()
+        conn.close()
+        return True
+    except Exception as e:
+        print(f"❌ Error saving settings: {e}")
+        return False
 
-def save_settings(settings):
-    """Sozlamalarni saqlash"""
-    with open(SETTINGS_FILE, 'w', encoding='utf-8') as f:
-        json.dump(settings, f, ensure_ascii=False, indent=2)
-
-def is_admin(username):
+def is_admin(username: str) -> bool:
     """Adminlikni tekshirish"""
     return username in ADMINS
 
-# ==== O'zgartirilgan klaviaturalar: doimiy pastki menyu qo'shiladi ====
+# ==================== KLAVIATURA FUNKSIYALARI ====================
+
 def main_menu_keyboard():
-    """Doimiy pastki menyu (har doim pastda ko'rinadi)"""
-    return ReplyKeyboardMarkup([["📂 Mening ma'lumotlarim"]], resize_keyboard=True, one_time_keyboard=False)
+    """Oddiy foydalanuvchi uchun doimiy pastki menyu"""
+    return ReplyKeyboardMarkup(
+        [["📂 Mening ma'lumotlarim"]], 
+        resize_keyboard=True, 
+        one_time_keyboard=False
+    )
+
+def admin_menu_keyboard():
+    """Admin uchun doimiy pastki menyu"""
+    keyboard = [
+        ["📊 Barcha ma'lumotlar", "📥 Yuklab olish"],
+        ["🏠 Qidirish: Uy raqami", "🔍 Filter: Viloyat"],
+        ["🏘 Filter: Tuman", "⏰ Eslatma sozlash"]
+    ]
+    return ReplyKeyboardMarkup(keyboard, resize_keyboard=True)
 
 def create_viloyat_keyboard():
-    """Viloyatlar klaviaturasi (oxirgi qatorda doimiy menyu)"""
+    """Viloyatlar klaviaturasi"""
     viloyatlar = list(VILOYATLAR.keys())
     keyboard = []
     for i in range(0, len(viloyatlar), 2):
         row = viloyatlar[i:i+2]
         keyboard.append(row)
-    # Pastki qatorda doimiy menyuni qo'shamiz — foydalanuchi har doim ko'radi
     keyboard.append(["📂 Mening ma'lumotlarim"])
     return ReplyKeyboardMarkup(keyboard, resize_keyboard=True)
 
-def create_tuman_keyboard(viloyat):
-    """Tumanlar klaviaturasi (oxirgi qatorda doimiy menyu)"""
+def create_tuman_keyboard(viloyat: str):
+    """Tumanlar klaviaturasi"""
     tumanlar = VILOYATLAR.get(viloyat, [])
     keyboard = []
     for i in range(0, len(tumanlar), 2):
@@ -123,63 +351,76 @@ def create_tuman_keyboard(viloyat):
     keyboard.append(["📂 Mening ma'lumotlarim"])
     return ReplyKeyboardMarkup(keyboard, resize_keyboard=True)
 
+# ==================== HELPER FUNKSIYALAR ====================
+
 async def _store_bot_message(msg, context: ContextTypes.DEFAULT_TYPE):
+    """Bot xabarini saqlash (keyinroq o'chirish uchun)"""
     try:
-        context.user_data['last_bot_message'] = {'chat_id': msg.chat_id, 'message_id': msg.message_id}
-    except Exception:
+        context.user_data['last_bot_message'] = {
+            'chat_id': msg.chat_id, 
+            'message_id': msg.message_id
+        }
+    except:
         context.user_data.pop('last_bot_message', None)
 
 async def _delete_last_bot_message(context: ContextTypes.DEFAULT_TYPE):
+    """Oxirgi bot xabarini o'chirish"""
     info = context.user_data.get('last_bot_message')
     if not info:
         return
     try:
-        await context.bot.delete_message(chat_id=info['chat_id'], message_id=info['message_id'])
-    except Exception:
+        await context.bot.delete_message(
+            chat_id=info['chat_id'], 
+            message_id=info['message_id']
+        )
+    except:
         pass
     context.user_data.pop('last_bot_message', None)
 
+# ==================== BOT HANDLERLARI ====================
+
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Botni boshlash — doimiy pastki menyu ko'rsatiladi"""
+    """Botni boshlash"""
     user = update.effective_user
     
-    # Admin uchun maxsus menyu
     if is_admin(user.username):
-        keyboard = [
-            ["📊 Barcha ma'lumotlar", "🔍 Filter: Viloyat"],
-            ["🏘 Filter: Tuman", "🏠 Qidirish: Uy raqami"],
-            ["📝 Ma'lumot yuborish", "⏰ Eslatma sozlash"]
-        ]
-        reply_markup = ReplyKeyboardMarkup(keyboard, resize_keyboard=True)
+        reply_markup = admin_menu_keyboard()
         await update.message.reply_text(
             f"👋 Assalomu alaykum, {user.first_name}!\n\n"
             "🔐 Admin panelga xush kelibsiz.\n"
             "Quyidagi bo'limlardan birini tanlang:",
             reply_markup=reply_markup
         )
-        return ConversationHandler.END
+    else:
+        reply_markup = main_menu_keyboard()
+        await update.message.reply_text(
+            f"👋 Assalomu alaykum, {user.first_name}!\n\n"
+            "O'zingizning oldingi ma'lumotlaringizni ko'rish uchun "
+            "'📂 Mening ma'lumotlarim' tugmasini bosing.",
+            reply_markup=reply_markup
+        )
     
-    # Oddiy istemolchi uchun — doimiy pastki menyu ko'rsatiladi
-    reply_markup = main_menu_keyboard()
-    await update.message.reply_text(
-        f"👋 Assalomu alaykum, {user.first_name}!\n\n"
-        "O'zingizning oldingi ma'lumotlaringizni ko'rish uchun '📂 Mening ma'lumotlarim' tugmasini bosing.",
-        reply_markup=reply_markup
-    )
-    # Menyuda yuborilgan xabarni o'chirishga hojat yo'q — doimiy menyu doimo qoladi
     return ConversationHandler.END
 
-async def start_fill(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Foydalanuvchi '📝 Ma'lumot yuborish' tugmasini bossin — viloyat so'raladi"""
-    # agar oldingi bot xabari saqlangan bo'lsa, o'chiramiz (konversatsiya ichida eski promptlarni tozalash uchun)
-    await _delete_last_bot_message(context)
-
-    msg = await update.message.reply_text(
-        "📋 Ma'lumot to'ldirish uchun viloyatingizni tanlang:",
+async def fill_info_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Reminder tugmasi bosilganda conversationni boshlash"""
+    query = update.callback_query
+    await query.answer()
+    
+    try:
+        await query.message.delete()
+    except:
+        pass
+    
+    msg = await context.bot.send_message(
+        chat_id=query.from_user.id,
+        text="📋 Ma'lumot to'ldirish uchun viloyatingizni tanlang:",
         reply_markup=create_viloyat_keyboard()
     )
     await _store_bot_message(msg, context)
     return VILOYAT
+
+# ==================== CONVERSATION HANDLERS ====================
 
 async def get_viloyat(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Viloyatni olish"""
@@ -217,7 +458,10 @@ async def get_tuman(update: Update, context: ContextTypes.DEFAULT_TYPE):
     
     context.user_data['tuman'] = tuman
     
-    keyboard = [["Kvartal", "Mahalla"], ["📝 Ma'lumot yuborish", "📂 Mening ma'lumotlarim"]]
+    keyboard = [
+        ["Kvartal", "Mahalla"], 
+        ["📂 Mening ma'lumotlarim"]
+    ]
     msg = await update.message.reply_text(
         "🏘 Kvartal yoki mahallada yashayszmi?",
         reply_markup=ReplyKeyboardMarkup(keyboard, resize_keyboard=True, one_time_keyboard=True)
@@ -231,7 +475,7 @@ async def get_kvartali_type(update: Update, context: ContextTypes.DEFAULT_TYPE):
     kvartali_type = update.message.text
     
     if kvartali_type not in ["Kvartal", "Mahalla"]:
-        keyboard = [["Kvartal", "Mahalla"], ["📝 Ma'lumot yuborish", "📂 Mening ma'lumotlarim"]]
+        keyboard = [["Kvartal", "Mahalla"], ["📂 Mening ma'lumotlarim"]]
         await update.message.reply_text(
             "❌ Iltimos, Kvartal yoki Mahalla tanlang!",
             reply_markup=ReplyKeyboardMarkup(keyboard, resize_keyboard=True)
@@ -275,6 +519,7 @@ async def get_manzil(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def get_rasm(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Rasmni olish va ma'lumotlarni saqlash"""
     await _delete_last_bot_message(context)
+    
     if not update.message.photo:
         msg = await update.message.reply_text(
             "❌ Iltimos, rasm yuboring!",
@@ -284,61 +529,92 @@ async def get_rasm(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return RASM
     
     photo = update.message.photo[-1]
-    context.user_data['photo_id'] = photo.file_id
-    
-    # Ma'lumotlarni saqlash
-    data = load_data()
     user = update.effective_user
     
-    viloyat = context.user_data['viloyat']
-    tuman = context.user_data['tuman']
-    
-    # Struktura yaratish
-    if viloyat not in data:
-        data[viloyat] = {}
-    if tuman not in data[viloyat]:
-        data[viloyat][tuman] = []
-    
-    # Yangi ma'lumot
-    entry = {
-        'user_id': str(user.id),
-        'username': user.username or "Mavjud emas",
-        'first_name': user.first_name,
-        'kvartali_type': context.user_data['kvartali_type'],
-        'kvartali_name': context.user_data['kvartali_name'],
-        'manzil': context.user_data['manzil'],
-        'photo_id': context.user_data['photo_id'],
-        'date': datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-    }
-    
-    data[viloyat][tuman].append(entry)
-    save_data(data)
-    
-    # Keyingi to'ldirish vaqtini olish
-    settings = load_settings()
-    reminder_time = settings.get('reminder_time', '18:00')
-    
-    # Tasdiqlash xabari
-    success_message = (
-        "✅ <b>Ma'lumotlar muvaffaqiyatli saqlandi!</b>\n\n"
-        "📋 <b>Sizning ma'lumotlaringiz:</b>\n"
-        f"📍 Viloyat: <b>{viloyat}</b>\n"
-        f"🏘 Tuman: <b>{tuman}</b>\n"
-        f"🏘 {context.user_data['kvartali_type']}: <b>{context.user_data['kvartali_name']}</b>\n"
-        f"🏠 Manzil: <b>{context.user_data['manzil']}</b>\n"
-        f"📅 Sana: <b>{entry['date']}</b>\n\n"
-        f"⏰ <b>Keyingi to'ldirish vaqti: {reminder_time}</b>\n\n"
-        "Rahmat! 🙏"
+    # Database ga saqlash
+    success = save_consumer_data(
+        user_id=user.id,
+        username=user.username or "Mavjud emas",
+        first_name=user.first_name or "Noma'lum",
+        viloyat=context.user_data['viloyat'],
+        tuman=context.user_data['tuman'],
+        kvartali_type=context.user_data['kvartali_type'],
+        kvartali_name=context.user_data['kvartali_name'],
+        manzil=context.user_data['manzil'],
+        photo_id=photo.file_id
     )
     
-    await update.message.reply_text(
-        success_message,
-        parse_mode='HTML',
-        reply_markup=main_menu_keyboard()
-    )
+    if success:
+        settings = load_settings()
+        reminder_time = settings.get('reminder_time', '10:00')
+        
+        success_message = (
+            "✅ <b>Ma'lumotlar muvaffaqiyatli saqlandi!</b>\n\n"
+            "📋 <b>Sizning ma'lumotlaringiz:</b>\n"
+            f"📍 Viloyat: <b>{context.user_data['viloyat']}</b>\n"
+            f"🏘 Tuman: <b>{context.user_data['tuman']}</b>\n"
+            f"🏘 {context.user_data['kvartali_type']}: <b>{context.user_data['kvartali_name']}</b>\n"
+            f"🏠 Manzil: <b>{context.user_data['manzil']}</b>\n"
+            f"📅 Sana: <b>{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}</b>\n\n"
+            f"⏰ <b>Keyingi to'ldirish vaqti: {reminder_time}</b>\n\n"
+            "Rahmat! 🙏"
+        )
+        
+        await update.message.reply_text(
+            success_message,
+            parse_mode='HTML',
+            reply_markup=main_menu_keyboard()
+        )
+    else:
+        await update.message.reply_text(
+            "❌ Ma'lumotlarni saqlashda xatolik yuz berdi. Iltimos qayta urinib ko'ring.",
+            reply_markup=main_menu_keyboard()
+        )
     
     context.user_data.clear()
     return ConversationHandler.END
+
+# ==================== FOYDALANUVCHI FUNKSIYALARI ====================
+
+async def my_data(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Foydalanuvchi o'z ma'lumotlarini ko'radi"""
+    user = update.effective_user
+    user_entries = get_user_data(user.id)
+    
+    if not user_entries:
+        await update.message.reply_text(
+            "📭 Sizda saqlangan ma'lumotlar topilmadi.",
+            reply_markup=main_menu_keyboard()
+        )
+        return
+    
+    await update.message.reply_text(
+        f"📋 Sizning ma'lumotlaringiz: {len(user_entries)} ta\n\n"
+        "Ma'lumotlar yuborilmoqda...",
+        reply_markup=main_menu_keyboard()
+    )
+    
+    for i, entry in enumerate(user_entries, 1):
+        text = (
+            f"#{i}\n"
+            f"👤 <b>{entry['first_name']}</b>\n"
+            f"🏙 Viloyat: {entry['viloyat']}\n"
+            f"📍 Tuman: {entry['tuman']}\n"
+            f"🏡 {entry['kvartali_type']}: {entry['kvartali_name']}\n"
+            f"📫 Manzil: {entry['manzil']}\n"
+            f"🕒 Sana: {entry['date']}"
+        )
+        
+        if entry.get("photo_id"):
+            await update.message.reply_photo(
+                photo=entry["photo_id"],
+                caption=text,
+                parse_mode="HTML"
+            )
+        else:
+            await update.message.reply_text(text, parse_mode="HTML")
+
+# ==================== ADMIN FUNKSIYALARI ====================
 
 async def show_all_data(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Barcha ma'lumotlarni ko'rsatish (Admin)"""
@@ -351,13 +627,13 @@ async def show_all_data(update: Update, context: ContextTypes.DEFAULT_TYPE):
     data = load_data()
     
     if not data:
-        await update.message.reply_text("📭 Hozircha ma'lumotlar yo'q!")
+        await update.message.reply_text(
+            "📭 Hozircha ma'lumotlar yo'q!", 
+            reply_markup=admin_menu_keyboard()
+        )
         return
     
-    total_count = 0
-    for viloyat_data in data.values():
-        for tuman_data in viloyat_data.values():
-            total_count += len(tuman_data)
+    total_count = sum(len(entries) for vil in data.values() for entries in vil.values())
     
     await update.message.reply_text(
         f"📊 <b>Umumiy statistika:</b>\n\n"
@@ -374,66 +650,29 @@ async def show_all_data(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await update.message.reply_text(header, parse_mode='HTML')
             
             for i, entry in enumerate(entries, 1):
+                if not isinstance(entry, dict):
+                    continue
+                
                 caption = (
                     f"#{i}\n"
-                    f"👤 Ism: <b>{entry['first_name']}</b>\n"
-                    f"🏘 {entry['kvartali_type']}: <b>{entry['kvartali_name']}</b>\n"
-                    f"🏠 Manzil: <b>{entry['manzil']}</b>\n"
-                    f"📅 Sana: <b>{entry['date']}</b>\n"
-                    f"👤 Username: @{entry['username']}"
+                    f"👤 Ism: <b>{entry.get('first_name', '-')}</b>\n"
+                    f"🏘 {entry.get('kvartali_type', '-')}: <b>{entry.get('kvartali_name', '-')}</b>\n"
+                    f"🏠 Manzil: <b>{entry.get('manzil', '-')}</b>\n"
+                    f"📅 Sana: <b>{entry.get('date', '-')}</b>\n"
+                    f"👤 Username: @{entry.get('username', '-')}"
                 )
                 
-                await update.message.reply_photo(
-                    photo=entry['photo_id'],
-                    caption=caption,
-                    parse_mode='HTML'
-                )
-async def fill_info_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Reminderdagi 'Ma'lumot to'ldirish' tugmasi bosilganda conversationni boshlash"""
-    query = update.callback_query
-    await query.answer()
-    # Foydalanuvchiga yuborilgan reminder xabarini o'chirish
-    try:
-        await query.message.delete()
-    except Exception:
-        pass
-    # Conversation boshlash uchun viloyat so'raymiz
-    msg = await context.bot.send_message(
-        chat_id=query.from_user.id,
-        text="📋 Ma'lumot to'ldirish uchun viloyatingizni tanlang:",
-        reply_markup=create_viloyat_keyboard()
-    )
-    await _store_bot_message(msg, context)
-    return VILOYAT
-
-async def my_data(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Foydalanuvchi o'z yuborgan ma'lumotlarini ko'radi"""
-    user = update.effective_user
-    data = load_data()
-    user_entries = []
-    for viloyat, vil_data in data.items():
-        for tuman, entries in vil_data.items():
-            for entry in entries:
-                if str(user.id) == entry.get('user_id'):
-                    user_entries.append((viloyat, tuman, entry))
-    if not user_entries:
-        await update.message.reply_text("📭 Sizda saqlangan ma'lumotlar topilmadi.", reply_markup=main_menu_keyboard())
-        return
-    await update.message.reply_text(f"📋 Sizning ma'lumotlaringiz: {len(user_entries)} ta\n\nMa'lumotlar yuborilmoqda...", reply_markup=main_menu_keyboard())
-    for i, (vil, tum, entry) in enumerate(user_entries, 1):
-        caption = (
-            f"#{i}\n"
-            f"📍 <b>{vil} - {tum}</b>\n"
-            f"👤 Ism: <b>{entry['first_name']}</b>\n"
-            f"🏘 {entry['kvartali_type']}: <b>{entry['kvartali_name']}</b>\n"
-            f"🏠 Manzil: <b>{entry['manzil']}</b>\n"
-            f"📅 Sana: <b>{entry['date']}</b>\n"
-            f"👤 Username: @{entry['username']}"
-        )
-        try:
-            await update.message.reply_photo(photo=entry['photo_id'], caption=caption, parse_mode='HTML')
-        except Exception:
-            await update.message.reply_text(caption, parse_mode='HTML')
+                photo_id = entry.get('photo_id')
+                if photo_id:
+                    await update.message.reply_photo(
+                        photo=photo_id,
+                        caption=caption,
+                        parse_mode='HTML'
+                    )
+                else:
+                    await update.message.reply_text(caption, parse_mode='HTML')
+    
+    await update.message.reply_text("✅ Tayyor.", reply_markup=admin_menu_keyboard())
 
 async def filter_by_viloyat_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Viloyat bo'yicha filtrlash boshlash"""
@@ -465,7 +704,7 @@ async def filter_by_viloyat(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if viloyat not in data:
         await update.message.reply_text(
             f"📭 {viloyat} uchun ma'lumotlar topilmadi!",
-            reply_markup=ReplyKeyboardRemove()
+            reply_markup=admin_menu_keyboard()
         )
         return ConversationHandler.END
     
@@ -493,12 +732,16 @@ async def filter_by_viloyat(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 f"👤 Username: @{entry['username']}"
             )
             
-            await update.message.reply_photo(
-                photo=entry['photo_id'],
-                caption=caption,
-                parse_mode='HTML'
-            )
+            if entry.get('photo_id'):
+                await update.message.reply_photo(
+                    photo=entry['photo_id'],
+                    caption=caption,
+                    parse_mode='HTML'
+                )
+            else:
+                await update.message.reply_text(caption, parse_mode='HTML')
     
+    await update.message.reply_text("✅ Tayyor.", reply_markup=admin_menu_keyboard())
     return ConversationHandler.END
 
 async def filter_by_tuman_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -543,7 +786,7 @@ async def filter_by_tuman(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not viloyat or tuman not in VILOYATLAR.get(viloyat, []):
         await update.message.reply_text(
             "❌ Iltimos, ro'yxatdan tuman tanlang!",
-            reply_markup=create_tuman_keyboard(viloyat)
+            reply_markup=create_tuman_keyboard(viloyat) if viloyat else admin_menu_keyboard()
         )
         return ADMIN_FILTER_TUMAN
     
@@ -552,7 +795,7 @@ async def filter_by_tuman(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if viloyat not in data or tuman not in data[viloyat]:
         await update.message.reply_text(
             f"📭 {viloyat} - {tuman} uchun ma'lumotlar topilmadi!",
-            reply_markup=ReplyKeyboardRemove()
+            reply_markup=admin_menu_keyboard()
         )
         context.user_data.clear()
         return ConversationHandler.END
@@ -577,12 +820,16 @@ async def filter_by_tuman(update: Update, context: ContextTypes.DEFAULT_TYPE):
             f"👤 Username: @{entry['username']}"
         )
         
-        await update.message.reply_photo(
-            photo=entry['photo_id'],
-            caption=caption,
-            parse_mode='HTML'
-        )
+        if entry.get('photo_id'):
+            await update.message.reply_photo(
+                photo=entry['photo_id'],
+                caption=caption,
+                parse_mode='HTML'
+            )
+        else:
+            await update.message.reply_text(caption, parse_mode='HTML')
     
+    await update.message.reply_text("✅ Tayyor.", reply_markup=admin_menu_keyboard())
     context.user_data.clear()
     return ConversationHandler.END
 
@@ -603,24 +850,13 @@ async def search_by_uy_start(update: Update, context: ContextTypes.DEFAULT_TYPE)
 
 async def search_by_uy(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Uy raqami bo'yicha qidirish"""
-    search_term = update.message.text.lower()
-    data = load_data()
-    
-    results = []
-    
-    for viloyat, viloyat_data in data.items():
-        for tuman, entries in viloyat_data.items():
-            for entry in entries:
-                if search_term in entry['manzil'].lower():
-                    results.append({
-                        'viloyat': viloyat,
-                        'tuman': tuman,
-                        'entry': entry
-                    })
+    search_term = update.message.text
+    results = search_by_address(search_term)
     
     if not results:
         await update.message.reply_text(
-            f"❌ '{search_term}' bo'yicha natija topilmadi!"
+            f"❌ '{search_term}' bo'yicha natija topilmadi!",
+            reply_markup=admin_menu_keyboard()
         )
         return ConversationHandler.END
     
@@ -643,13 +879,58 @@ async def search_by_uy(update: Update, context: ContextTypes.DEFAULT_TYPE):
             f"👤 Username: @{entry['username']}"
         )
         
-        await update.message.reply_photo(
-            photo=entry['photo_id'],
-            caption=caption,
-            parse_mode='HTML'
-        )
+        if entry.get('photo_id'):
+            await update.message.reply_photo(
+                photo=entry['photo_id'],
+                caption=caption,
+                parse_mode='HTML'
+            )
+        else:
+            await update.message.reply_text(caption, parse_mode='HTML')
     
+    await update.message.reply_text("✅ Tayyor.", reply_markup=admin_menu_keyboard())
     return ConversationHandler.END
+
+async def export_all_data(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Admin uchun: barcha ma'lumotlarni JSON fayl sifatida yuklab olish"""
+    user = update.effective_user
+    if not is_admin(user.username):
+        await update.message.reply_text("❌ Sizda bu funksiyadan foydalanish huquqi yo'q!")
+        return
+    
+    data = load_data()
+    if not data:
+        await update.message.reply_text("📭 Hozircha ma'lumotlar yo'q!", reply_markup=admin_menu_keyboard())
+        return
+    
+    fname = f"consumers_data_{datetime.now().strftime('%Y%m%d_%H%M%S')}.json"
+    try:
+        with open(fname, "w", encoding="utf-8") as f:
+            json.dump(data, f, ensure_ascii=False, indent=2)
+        
+        with open(fname, "rb") as doc:
+            await context.bot.send_document(
+                chat_id=update.effective_user.id,
+                document=doc,
+                filename=fname,
+                caption="📥 Barcha ma'lumotlar (JSON fayl)"
+            )
+        
+        await update.message.reply_text(
+            "✅ Ma'lumotlar fayl sifatida yuborildi.", 
+            reply_markup=admin_menu_keyboard()
+        )
+    except Exception as e:
+        print(f"Error exporting data: {e}")
+        await update.message.reply_text("❌ Fayl yaratishda yoki yuborishda xatolik yuz berdi.")
+    finally:
+        try:
+            if os.path.exists(fname):
+                os.remove(fname)
+        except:
+            pass
+
+# ==================== ESLATMA FUNKSIYALARI ====================
 
 async def set_reminder(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Eslatma vaqtini o'rnatish (oylik kun)"""
@@ -659,7 +940,6 @@ async def set_reminder(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("❌ Sizda bu funksiyadan foydalanish huquqi yo'q!")
         return
     
-    # Oyning kunlari uchun klaviatura
     keyboard = []
     row = []
     for i in range(1, 32):
@@ -688,100 +968,91 @@ async def set_reminder(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
 
 async def set_reminder_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Eslatma vaqtini callback orqali o'rnatish"""
+    """Eslatma kunini callback orqali o'rnatish"""
     query = update.callback_query
     await query.answer()
+    data = query.data
     
-    if query.data == "day_off":
-        settings = load_settings()
-        settings['reminder_enabled'] = False
-        save_settings(settings)
+    try:
+        if data == "day_off":
+            settings = load_settings()
+            settings['reminder_enabled'] = False
+            settings['reminder_day'] = None
+            save_settings(settings)
+            
+            if getattr(context, "job_queue", None):
+                for job in context.job_queue.get_jobs_by_name("monthly_reminder"):
+                    job.schedule_removal()
+            
+            await query.edit_message_text("❌ Eslatma o'chirildi!", parse_mode='HTML')
+            await context.bot.send_message(
+                chat_id=query.from_user.id, 
+                text="✅ Eslatma o'chirildi va sozlamalar saqlandi."
+            )
+            return
         
-        # Oldingi jobni o'chirish
-        current_jobs = context.job_queue.get_jobs_by_name("daily_reminder")
-        for job in current_jobs:
-            job.schedule_removal()
+        if data and data.startswith("day_"):
+            day = int(data.split("_", 1)[1])
+            
+            settings = load_settings()
+            settings['reminder_day'] = day
+            settings['reminder_enabled'] = True
+            settings.setdefault('reminder_time', "10:00")
+            save_settings(settings)
+            
+            if getattr(context, "job_queue", None):
+                for job in context.job_queue.get_jobs_by_name("monthly_reminder"):
+                    job.schedule_removal()
+                context.job_queue.run_monthly(
+                    send_reminder,
+                    when=time(hour=10, minute=0),
+                    day=day,
+                    name="monthly_reminder"
+                )
+            
+            await query.edit_message_text(
+                f"✅ <b>Eslatma muvaffaqiyatli o'rnatildi!</b>\n\n"
+                f"📅 Har oyning <b>{day}-kuni</b>\n"
+                f"⏰ Soat: <b>{settings.get('reminder_time', '10:00')}</b>\n"
+                f"Barcha istemolchilarga eslatma yuboriladi.",
+                parse_mode='HTML'
+            )
+            await context.bot.send_message(
+                chat_id=query.from_user.id,
+                text=f"✅ Yangi eslatma saqlandi: har oyning {day}-kuni soat {settings.get('reminder_time', '10:00')}"
+            )
+            return
         
-        await query.edit_message_text(
-            "❌ Eslatma o'chirildi!",
-            parse_mode='HTML'
-        )
-        return  
-    
-    # Vaqtni olish
-    reminder_time = query.data.replace("time_", "")
-    hour, minute = map(int, reminder_time.split(":"))
-    
-    # Sozlamalarni saqlash
-    settings = load_settings()
-    settings['reminder_time'] = reminder_time
-    settings['reminder_enabled'] = True
-    save_settings(settings)
-    
-    day = int(query.data.replace("day_", ""))
-    
-    # Sozlamalarni saqlash
-    settings = load_settings()
-    settings['reminder_day'] = day
-    settings['reminder_enabled'] = True
-    save_settings(settings)
-    # Oldingi jobni o'chirish
-    current_jobs = context.job_queue.get_jobs_by_name("monthly_reminder")
-    for job in current_jobs:
-        job.schedule_removal()
-    
-    # Yangi job qo'shish
-    context.job_queue.run_monthly(
-        send_reminder,
-        when=time(hour=10, minute=0),  # Default 10:00
-        day=day,
-        name="monthly_reminder"
-    )
-    
-    await query.edit_message_text(
-        f"✅ <b>Eslatma muvaffaqiyatli o'rnatildi!</b>\n\n"
-        f"📅 Har oyning <b>{day}-kuni</b>\n"
-        f"⏰ Soat: <b>10:00</b>\n"
-        f"Barcha istemolchilarga eslatma yuboriladi.",
-        parse_mode='HTML'
-    )
-def admin_menu_keyboard():
-    """Admin uchun doimiy pastki menyu"""
-    keyboard = [
-        ["📊 Barcha ma'lumotlar", "🔍 Filter: Viloyat"],
-        ["🏘 Filter: Tuman", "🏠 Qidirish: Uy raqami"],
-        ["📝 Ma'lumot yuborish", "⏰ Eslatma sozlash"]
-    ]
-    return ReplyKeyboardMarkup(keyboard, resize_keyboard=True)
+        await query.edit_message_text("❌ Noma'lum tugma ma'lumoti. Iltimos qayta urinib ko'ring.")
+    except Exception as e:
+        print(f"Error in set_reminder_callback: {e}")
+        try:
+            await query.edit_message_text("❌ Xatolik yuz berdi. Iltimos qayta urinib ko'ring.")
+        except:
+            pass
+
 async def send_reminder(context: ContextTypes.DEFAULT_TYPE):
-    """Barcha istemolchilarga eslatma yuborish — inline tugma bilan, tugma bosilganda conversation boshlanadi"""
-    data = load_data()
-    sent_users = set()
+    """Barcha istemolchilarga eslatma yuborish"""
+    user_ids = get_all_user_ids()
     success_count = 0
     fail_count = 0
     kb = InlineKeyboardMarkup([[InlineKeyboardButton("📝 Ma'lumot to'ldirish", callback_data="fill_info")]])
-
-    for viloyat_data in data.values():
-        for entries in viloyat_data.values():
-            for entry in entries:
-                user_id = entry['user_id']
-                if user_id not in sent_users:
-                    try:
-                        await context.bot.send_message(
-                            chat_id=int(user_id),
-                            text="⏰ <b>Eslatma!</b>\n\n"
-                                 "📋 Issiq suv hisoblagichingizning yangi ma'lumotlarini yuborish vaqti keldi.\n\n"
-                                 "Ma'lumotlarni yuborish uchun quyidagi tugmani bosing:",
-                            parse_mode='HTML',
-                            reply_markup=kb
-                        )
-                        sent_users.add(user_id)
-                        success_count += 1
-                    except Exception as e:
-                        fail_count += 1
-                        print(f"❌ Error sending to {user_id}: {e}")
     
-    # Adminlarga hisobot
+    for user_id in user_ids:
+        try:
+            await context.bot.send_message(
+                chat_id=int(user_id),
+                text="⏰ <b>Eslatma!</b>\n\n"
+                     "📋 Issiq suv hisoblagichingizning yangi ma'lumotlarini yuborish vaqti keldi.\n\n"
+                     "Ma'lumotlarni yuborish uchun quyidagi tugmani bosing:",
+                parse_mode='HTML',
+                reply_markup=kb
+            )
+            success_count += 1
+        except Exception as e:
+            fail_count += 1
+            print(f"❌ Error sending to {user_id}: {e}")
+    
     for admin in ADMINS:
         try:
             await context.bot.send_message(
@@ -795,17 +1066,63 @@ async def send_reminder(context: ContextTypes.DEFAULT_TYPE):
         except:
             pass
 
+async def send_reminder_now(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Admin uchun: hozir barcha foydalanuvchilarga eslatma yuborish (test)"""
+    user = update.effective_user
+    if not is_admin(user.username):
+        await update.message.reply_text("❌ Sizda bu funksiyadan foydalanish huquqi yo'q!")
+        return
+    
+    await update.message.reply_text("🔁 Eslatma yuborish boshlandi. Iltimos kuting...")
+    
+    user_ids = get_all_user_ids()
+    
+    if not user_ids:
+        await update.message.reply_text("📭 Bazada foydalanuvchi ma'lumotlari yo'q.")
+        return
+    
+    success = []
+    failed = []
+    kb = InlineKeyboardMarkup([[InlineKeyboardButton("📝 Ma'lumot to'ldirish", callback_data="fill_info")]])
+    
+    for uid in user_ids:
+        try:
+            chat_id = int(uid)
+            await context.bot.send_message(
+                chat_id=chat_id,
+                text="⏰ <b>Eslatma!</b>\n\n"
+                     "📋 Issiq suv hisoblagichingizning yangi ma'lumotlarini yuborish vaqti keldi.\n\n"
+                     "Ma'lumotlarni yuborish uchun quyidagi tugmani bosing:",
+                parse_mode='HTML',
+                reply_markup=kb
+            )
+            success.append(uid)
+        except Exception as e:
+            failed.append((uid, str(e)))
+    
+    report = (
+        f"📊 Eslatma yuborish hisobot:\n\n"
+        f"Jami maqsadli foydalanuvchilar: {len(user_ids)}\n"
+        f"✅ Muvaffaqiyatli: {len(success)}\n"
+        f"❌ Xatolik: {len(failed)}\n"
+    )
+    
+    if failed:
+        report += "\nXatoliklar (bir nechta):\n"
+        for uid, err in failed[:20]:
+            report += f"- {uid}: {err}\n"
+    
+    await update.message.reply_text(report)
+    await update.message.reply_text("✅ Eslatma yuborish tugallandi.")
+
+# ==================== YORDAMCHI FUNKSIYALAR ====================
+
 async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Bekor qilish"""
     user = update.effective_user
     
     if is_admin(user.username):
-        keyboard = [
-            ["📊 Barcha ma'lumotlar", "🔍 Filter: Viloyat"],
-            ["🏘 Filter: Tuman", "🏠 Qidirish: Uy raqami"],
-            ["📝 Ma'lumot yuborish", "⏰ Eslatma sozlash"]
-        ]
-        reply_markup = ReplyKeyboardMarkup(keyboard, resize_keyboard=True)
+        reply_markup = admin_menu_keyboard()
     else:
         reply_markup = main_menu_keyboard()
     
@@ -828,15 +1145,16 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
             "🔍 <b>Filter: Viloyat</b> - Ma'lum viloyat bo'yicha ma'lumotlarni ko'rish\n"
             "🏘 <b>Filter: Tuman</b> - Ma'lum tuman bo'yicha ma'lumotlarni ko'rish\n"
             "🏠 <b>Qidirish: Uy raqami</b> - Uy raqami bo'yicha qidirish\n"
-            "📝 <b>Ma'lumot yuborish</b> - O'zingiz ma'lumot yuborish\n"
-            "⏰ <b>Eslatma sozlash</b> - Kunlik eslatma vaqtini belgilash\n\n"
-            "❌ <b>/cancel</b> - Jarayonni bekor qilish"
+            "⏰ <b>Eslatma sozlash</b> - Oylik eslatma sozlash\n"
+            "📥 <b>Yuklab olish</b> - Barcha ma'lumotlarni fayl sifatida olish\n\n"
+            "❌ <b>/cancel</b> - Jarayonni bekor qilish\n"
+            "🔔 <b>/send_reminder</b> - Test uchun hozir eslatma yuborish"
         )
+        reply_markup = admin_menu_keyboard()
     else:
         text = (
             "📋 <b>Bot haqida ma'lumot:</b>\n\n"
             "Bu bot orqali siz issiq suv hisoblagichingizning ma'lumotlarini yuborishingiz mumkin.\n\n"
-            "📝 Boshlash: menyudan '📝 Ma'lumot yuborish' tugmasini bosing yoki reminder dagi tugmani ishlating.\n"
             "❌ <b>/cancel</b> - Bekor qilish\n"
             "❓ <b>/help</b> - Yordam\n\n"
             "Ma'lumot yuborish jarayoni:\n"
@@ -848,17 +1166,22 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
             "6️⃣ Hisoblagich rasmini yuboring\n\n"
             "❗️ Bot sizga belgilangan vaqtda eslatma yuboradi."
         )
+        reply_markup = main_menu_keyboard()
     
-    await update.message.reply_text(text, parse_mode='HTML', reply_markup=main_menu_keyboard())
+    await update.message.reply_text(text, parse_mode='HTML', reply_markup=reply_markup)
+
+# ==================== ASOSIY FUNKSIYA ====================
 
 def main():
     """Botni ishga tushirish"""
+    # Database ni initialize qilish
+    _init_db()
+    
     application = Application.builder().token(BOT_TOKEN).build()
     
-    # Istemolchilar uchun conversation handler (faqat menu tugmasi yoki reminder tugmasi orqali boshlanadi)
+    # Consumer conversation handler
     consumer_conv = ConversationHandler(
         entry_points=[
-            # MessageHandler(filters.Regex("^📝 Ma'lumot yuborish$"), start_fill),
             CallbackQueryHandler(fill_info_callback, pattern="^fill_info$")
         ],
         states={
@@ -874,7 +1197,7 @@ def main():
         persistent=False
     )
     
-    # Viloyat filtri uchun conversation handler
+    # Viloyat filter conversation
     viloyat_filter_conv = ConversationHandler(
         entry_points=[
             MessageHandler(filters.Regex("^🔍 Filter: Viloyat$"), filter_by_viloyat_start)
@@ -886,7 +1209,7 @@ def main():
         name="viloyat_filter"
     )
     
-    # Tuman filtri uchun conversation handler
+    # Tuman filter conversation
     tuman_filter_conv = ConversationHandler(
         entry_points=[
             MessageHandler(filters.Regex("^🏘 Filter: Tuman$"), filter_by_tuman_start)
@@ -899,7 +1222,7 @@ def main():
         name="tuman_filter"
     )
     
-    # Uy raqami qidirish uchun conversation handler
+    # Uy raqami search conversation
     search_conv = ConversationHandler(
         entry_points=[
             MessageHandler(filters.Regex("^🏠 Qidirish: Uy raqami$"), search_by_uy_start)
@@ -917,15 +1240,21 @@ def main():
     application.add_handler(tuman_filter_conv)
     application.add_handler(search_conv)
     
-    # Buyruq va boshqa handlerlar
+    # Command handlerlar
     application.add_handler(CommandHandler("start", start))
-    application.add_handler(MessageHandler(filters.Regex("^📊 Barcha ma'lumotlar$"), show_all_data))
-    application.add_handler(MessageHandler(filters.Regex("^⏰ Eslatma sozlash$"), set_reminder))
-    application.add_handler(CallbackQueryHandler(set_reminder_callback, pattern="^day_"))
-    application.add_handler(CallbackQueryHandler(fill_info_callback, pattern="^fill_info$"))
-    application.add_handler(MessageHandler(filters.Regex("^📂 Mening ma'lumotlarim$"), my_data))
     application.add_handler(CommandHandler("help", help_command))
     application.add_handler(CommandHandler("cancel", cancel))
+    application.add_handler(CommandHandler("send_reminder", send_reminder_now))
+    
+    # Message handlerlar
+    application.add_handler(MessageHandler(filters.Regex("^📊 Barcha ma'lumotlar$"), show_all_data))
+    application.add_handler(MessageHandler(filters.Regex("^⏰ Eslatma sozlash$"), set_reminder))
+    application.add_handler(MessageHandler(filters.Regex("^📂 Mening ma'lumotlarim$"), my_data))
+    application.add_handler(MessageHandler(filters.Regex("^📥 Yuklab olish$"), export_all_data))
+    
+    # Callback handlerlar
+    application.add_handler(CallbackQueryHandler(set_reminder_callback, pattern="^day_"))
+    application.add_handler(CallbackQueryHandler(fill_info_callback, pattern="^fill_info$"))
     
     # Eslatma jobini yuklash
     settings = load_settings()
@@ -935,7 +1264,7 @@ def main():
             if application.job_queue:
                 application.job_queue.run_monthly(
                     send_reminder,
-                    when=time(hour=10, minute=0),  # Default 10:00
+                    when=time(hour=10, minute=0),
                     day=reminder_day,
                     name="monthly_reminder"
                 )
@@ -946,10 +1275,11 @@ def main():
     print("✅ Bot ishga tushdi!")
     try:
         bot_username = application.bot.username
-    except RuntimeError:
-        bot_username = "unknown"
-    print(f"📊 Bot username: @{bot_username}")
-    print(f"⏰ Eslatma: {'Yoniq' if settings.get('reminder_enabled') else "O'chiq"}")
+        print(f"📊 Bot username: @{bot_username}")
+    except:
+        print("📊 Bot username: unknown")
+    
+    print(f"⏰ Eslatma: {'Yoniq' if settings.get('reminder_enabled') else 'O\'chiq'}")
     
     application.run_polling(allowed_updates=Update.ALL_TYPES)
 
