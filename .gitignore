@@ -46,12 +46,14 @@ htmlcov/
 .cache
 nosetests.xml
 coverage.xml
+bot_settings.json.bak
+consumers_data.json.bak
 *.cover
 *.py.cover
 .hypothesis/
 .pytest_cache/
 cover/
-
+data.db
 # Translations
 *.mo
 *.pot
